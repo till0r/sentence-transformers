@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 from transformers import AutoModel, AutoTokenizer, AutoConfig, T5Config, MT5Config
 import json
@@ -71,11 +72,18 @@ class Transformer(nn.Module):
         if 'token_type_ids' in features:
             trans_features['token_type_ids'] = features['token_type_ids']
 
+        # Chunk length 1024 to max_seq_length resulting in shape [bs * 2, max_seq_length]
+        trans_features["input_ids"] = self.chunk_tensor(trans_features["input_ids"], chunking_strategy='first_two')
+        trans_features['attention_mask'] = self.chunk_tensor(trans_features['attention_mask'], chunking_strategy='first_two')
+
         output_states = self.auto_model(**trans_features, return_dict=False)
         output_tokens = output_states[0]
 
-        features.update({'token_embeddings': output_tokens, 'attention_mask': features['attention_mask']})
+        # Unchunk
+        output_tokens, attention_mask = self.unchunk_tensor(output_tokens, trans_features['attention_mask'])
 
+        features.update({'token_embeddings': output_tokens, 'attention_mask': attention_mask})
+ 
         if self.auto_model.config.output_hidden_states:
             all_layer_idx = 2
             if len(output_states) < 3: #Some models only output last_hidden_states and all_hidden_states
@@ -85,6 +93,32 @@ class Transformer(nn.Module):
             features.update({'all_layer_embeddings': hidden_states})
 
         return features
+    
+    def chunk_tensor(self, tensor, chunking_strategy='first_two'):
+        """Splits the tensor along dim 1 into two halves"""
+        half_size = tensor.shape[1] // 2
+        first_half = tensor[:, :half_size]
+        second_half = tensor[:, half_size:]
+
+        return torch.cat((first_half, second_half), dim=0)
+    
+    def unchunk_tensor(self, output_tokens, attention_mask, chunking_strategy='first_two'):
+        """Means the tensor along dim 2 from two halves, weighted by the sum of the attention mask"""
+        half_size = output_tokens.shape[0] // 2
+        first_half = output_tokens[:half_size]
+        second_half = output_tokens[half_size:]
+
+        first_half * (torch.sum(attention_mask[:half_size], dim=1).unsqueeze(-1).unsqueeze(-1).float() / 512)
+        second_half * (torch.sum(attention_mask[half_size:], dim=1).unsqueeze(-1).unsqueeze(-1).float() / 512)
+
+        summed = first_half + second_half
+
+        # Normalize summed
+        summed = summed / torch.norm(summed, dim=-1, keepdim=True)
+
+        return summed, attention_mask[:half_size]
+
+ 
 
     def get_word_embedding_dimension(self) -> int:
         return self.auto_model.config.hidden_size
